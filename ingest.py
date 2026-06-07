@@ -16,6 +16,7 @@ import json
 import time
 
 import numpy as np
+import redis
 from openai import OpenAI, RateLimitError
 from redisvl.index import SearchIndex
 from redisvl.schema import IndexSchema
@@ -76,17 +77,18 @@ def build_index() -> SearchIndex:
                 "prefix": config.KEY_PREFIX,
                 "storage_type": "hash",
             },
+            # Only doc_id and the vector are INDEXED. title/text are still
+            # written to each hash (and returned by queries) but not indexed,
+            # which saves the RediSearch inverted-index RAM -> more docs fit.
             "fields": [
                 {"name": "doc_id", "type": "tag"},
-                {"name": "title", "type": "text"},
-                {"name": "text", "type": "text"},
                 {
                     "name": "embedding",
                     "type": "vector",
                     "attrs": {
                         "dims": config.EMBED_DIMS,
                         "distance_metric": "cosine",
-                        "algorithm": "flat",
+                        "algorithm": config.VECTOR_ALGORITHM,
                         "datatype": "float32",
                     },
                 },
@@ -98,25 +100,48 @@ def build_index() -> SearchIndex:
     return index
 
 
+LOAD_BATCH = 5_000
+
+
 def main() -> None:
     docs = load_subset()
-    print(f"Loaded {len(docs)} docs from subset")
+    print(f"Loaded {len(docs)} docs from subset (gold docs first)")
 
     embeddings = get_embeddings(docs)
     assert embeddings.shape == (len(docs), config.EMBED_DIMS), embeddings.shape
 
     index = build_index()
-    records = [
-        {
-            "doc_id": d["_id"],
-            "title": d.get("title", ""),
-            "text": d.get("text", ""),
-            "embedding": embeddings[i].astype(np.float32).tobytes(),
-        }
-        for i, d in enumerate(docs)
-    ]
-    keys = index.load(records, id_field="doc_id")
-    print(f"Loaded {len(keys)} docs into Redis index '{config.INDEX_NAME}'")
+    mem_client = redis.from_url(config.require_redis_url())
+
+    # Load in batches; stop once Redis memory approaches the cap. Because the
+    # subset is written gold-docs-first, the gold docs are always loaded.
+    loaded = 0
+    for start in range(0, len(docs), LOAD_BATCH):
+        batch = docs[start : start + LOAD_BATCH]
+        records = [
+            {
+                "doc_id": d["_id"],
+                "title": d.get("title", ""),
+                "text": d.get("text", ""),
+                "embedding": embeddings[start + j].astype(np.float32).tobytes(),
+            }
+            for j, d in enumerate(batch)
+        ]
+        try:
+            index.load(records, id_field="doc_id")
+        except Exception as e:  # e.g. Redis OOM if we bump the hard limit
+            print(f"Stopping: Redis rejected a write at {loaded:,} docs ({type(e).__name__}: {e}).")
+            break
+        loaded += len(batch)
+        used = mem_client.info("memory")["used_memory"]
+        print(f"  loaded {loaded:,}/{len(docs):,} | redis used {used/1e9:.2f} GB")
+        if used >= config.REDIS_MEM_CAP_BYTES:
+            print(f"Reached memory cap ({config.REDIS_MEM_CAP_BYTES/1e9:.1f} GB); stopping.")
+            break
+
+    print(f"Done. Indexed {loaded:,} docs in '{config.INDEX_NAME}'.")
+    if loaded < len(docs):
+        print(f"NOTE: {len(docs) - loaded:,} distractor docs were skipped to stay under the cap.")
 
 
 if __name__ == "__main__":

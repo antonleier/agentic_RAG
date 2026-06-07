@@ -1,28 +1,28 @@
 """Evaluate the Redis RAG pipeline against HotpotQA labels with Weave.
 
-Two scorers:
-  retrieval_scorer  -- did we retrieve the gold docs? (recall, precision,
-                       full_support = all gold docs retrieved, the multi-hop bar)
-  answer_scorer     -- does the generated answer match the gold answer?
-                       (normalized exact match + lenient containment)
+Scorers:
+  hotpot_scorer     -- the OFFICIAL HotpotQA leaderboard metrics, computed with
+                       the ported scoring code in hotpot_metrics.py:
+                         Answer EM / F1, Supporting-fact EM / F1, Joint EM / F1
+  retrieval_scorer  -- supplementary IR diagnostics for the retriever:
+                       recall@k, precision@k, full_support (all gold docs found)
 
     python evaluate.py
 """
 import asyncio
 import csv
 import json
-import re
-import string
 from collections import defaultdict
 
 import weave
 
 import config
+from hotpot_metrics import score_example
 from rag_model import RedisRagModel
 
 
 def build_rows() -> list[dict]:
-    """Eval rows carrying the question, gold answer, and gold corpus-ids."""
+    """Eval rows: question, gold answer, gold supporting_facts, gold corpus-ids."""
     q2gold: dict[str, set[str]] = defaultdict(set)
     with open(config.QRELS_SUBSET) as f:
         reader = csv.reader(f, delimiter="\t")
@@ -35,22 +35,27 @@ def build_rows() -> list[dict]:
         for line in f:
             obj = json.loads(line)
             qid = obj["_id"]
+            meta = obj["metadata"]
             rows.append(
                 {
                     "question": obj["text"],
-                    "answer": str(obj["metadata"]["answer"]),  # some answers are non-str
+                    "answer": str(meta["answer"]),  # some answers are non-str
+                    "supporting_facts": meta["supporting_facts"],  # [[title, sent_idx], ...]
                     "gold_ids": sorted(q2gold[qid]),
                 }
             )
     return rows
 
 
-def _norm(s: str) -> str:
-    """SQuAD/HotpotQA-style normalization: lowercase, drop punct + articles."""
-    s = s.lower()
-    s = "".join(ch for ch in s if ch not in string.punctuation)
-    s = re.sub(r"\b(a|an|the)\b", " ", s)
-    return " ".join(s.split())
+@weave.op
+def hotpot_scorer(answer: str, supporting_facts: list, output: dict) -> dict:
+    """Official HotpotQA metrics: answer, supporting-fact, and joint EM/F1."""
+    return score_example(
+        pred_answer=output["answer"],
+        gold_answer=answer,
+        pred_sp=output.get("supporting_facts", []),
+        gold_sp=supporting_facts,
+    )
 
 
 @weave.op
@@ -66,15 +71,6 @@ def retrieval_scorer(gold_ids: list, output: dict) -> dict:
     }
 
 
-@weave.op
-def answer_scorer(answer: str, output: dict) -> dict:
-    gold, pred = _norm(answer), _norm(output["answer"])
-    return {
-        "exact_match": float(gold == pred),
-        "contains": float(bool(gold) and (gold in pred or pred in gold)),
-    }
-
-
 async def main() -> None:
     weave.init(config.WANDB_PROJECT)
     rows = build_rows()
@@ -82,7 +78,7 @@ async def main() -> None:
     evaluation = weave.Evaluation(
         name="hotpot-rag",
         dataset=rows,
-        scorers=[retrieval_scorer, answer_scorer],
+        scorers=[hotpot_scorer, retrieval_scorer],
     )
     results = await evaluation.evaluate(RedisRagModel())
     print(results)

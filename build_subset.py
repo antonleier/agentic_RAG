@@ -39,9 +39,13 @@ def main() -> None:
     rng = random.Random(config.SEED)
     q2gold = load_test_qrels()
 
-    sampled_qids = rng.sample(list(q2gold), config.N_QUERIES)
+    if config.N_QUERIES is None:
+        sampled_qids = sorted(q2gold)  # ALL test queries (the full leaderboard set)
+        print(f"Using all {len(sampled_qids)} test queries")
+    else:
+        sampled_qids = rng.sample(list(q2gold), config.N_QUERIES)
     gold_ids: set[str] = set().union(*(q2gold[q] for q in sampled_qids))
-    print(f"Sampled {len(sampled_qids)} queries -> {len(gold_ids)} gold docs")
+    print(f"{len(sampled_qids)} queries -> {len(gold_ids)} gold docs")
 
     n_distract = max(0, config.TARGET_CORPUS - len(gold_ids))
 
