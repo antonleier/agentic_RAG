@@ -1,5 +1,18 @@
 # Datasets
 hotpotqa/
 
+# Secrets
+.env
+
+# Generated artifacts (regenerable: subset + cached embeddings)
+data/
+
+# Python
+__pycache__/
+*.pyc
+
+# Nested project (own git repo)
+hackathon-sf/
+
 # macOS
 .DS_Store
